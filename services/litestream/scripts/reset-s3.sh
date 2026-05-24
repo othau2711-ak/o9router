@@ -12,21 +12,93 @@
 #    ./reset-s3.sh app             → chỉ xóa app db
 #    ./reset-s3.sh tinyauth app    → xóa nhiều DB
 #
-#  Yêu cầu: file .env phải có đủ LITESTREAM_S3_* vars
-#           và aws CLI đã được cài (hoặc chạy qua Docker)
+#  Env vars:
+#    ENV_FILE=<path>  override đường dẫn .env (mặc định: tự tìm)
+#
+#  Yêu cầu: aws CLI đã được cài (hoặc chạy qua Docker)
 # ================================================================
 set -e
 
-# ── Load .env từ project root ─────────────────────────────────────────────
+# ================================================================
+#  ENV LOADING — process env ưu tiên, .env file chỉ fill missing
+# ================================================================
+
+# Hàm set 1 var: chỉ export nếu chưa có trong process env
+# Return 0 = đã có sẵn trong process env, return 1 = lấy từ file
+load_env_var() {
+  _var_name="$1"
+  _file_value="$2"
+  eval "_cur=\${${_var_name}:-__UNSET__}"
+  if [ "$_cur" = "__UNSET__" ] || [ -z "$_cur" ]; then
+    # Chưa có trong process env → load từ file
+    # Dùng printf để xử lý value có ký tự đặc biệt an toàn
+    eval "export ${_var_name}='${_file_value}'"
+    return 1
+  fi
+  return 0
+}
+
+# Tự động tìm .env bằng cách đi ngược lên project root (tối đa 6 cấp)
+_find_env_file() {
+  _d="$1"
+  _i=0
+  while [ "$_i" -lt 6 ]; do
+    [ -f "${_d}/.env" ] && { echo "${_d}/.env"; return 0; }
+    _d="$(dirname "$_d")"
+    _i=$((_i + 1))
+  done
+  return 1
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/../../../../.env"
-if [ -f "$ENV_FILE" ]; then
-  # shellcheck disable=SC2046
-  export $(grep -v '^#' "$ENV_FILE" | grep -v '^$' | xargs)
-  echo "[INFO] Loaded .env from: $ENV_FILE"
-else
-  echo "[WARN] .env not found at $ENV_FILE, using existing environment variables."
+
+# ENV_FILE có thể được override từ ngoài (CI inject path cụ thể)
+if [ -z "${ENV_FILE:-}" ]; then
+  ENV_FILE="$(_find_env_file "$SCRIPT_DIR" 2>/dev/null || echo "")"
 fi
+
+_from_env=0   # số var lấy từ process env
+_from_file=0  # số var load từ .env file
+
+if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+  echo "[ENV] Found .env: $ENV_FILE"
+  echo "[ENV] Strategy: process env → .env file (process env takes priority)"
+
+  while IFS= read -r _line; do
+    # Bỏ comment và dòng trống
+    case "$_line" in '#'*|'') continue ;; esac
+    # Tách KEY=VALUE (value có thể chứa dấu = hoặc dấu nháy)
+    _key="${_line%%=*}"
+    _val="${_line#*=}"
+    # Bỏ dấu nháy bọc ngoài value nếu có ("value" hoặc 'value')
+    case "$_val" in
+      '"'*'"') _val="${_val#\"}"; _val="${_val%\"}" ;;
+      "'"*"'") _val="${_val#\'}"; _val="${_val%\'}" ;;
+    esac
+    # Chỉ xử lý key hợp lệ (chữ, số, gạch dưới)
+    case "$_key" in *[!A-Za-z0-9_]*|'') continue ;; esac
+
+    if load_env_var "$_key" "$_val"; then
+      _from_env=$((_from_env + 1))
+    else
+      _from_file=$((_from_file + 1))
+    fi
+  done < "$ENV_FILE"
+
+  echo "[ENV] Result: ${_from_env} var(s) from process env | ${_from_file} var(s) loaded from file"
+else
+  echo "[ENV] No .env file found — using process environment variables only."
+fi
+
+echo ""
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║           LITESTREAM S3 RESET TOOL                  ║"
+echo "╠══════════════════════════════════════════════════════╣"
+echo "║  Endpoint : $ENDPOINT"
+echo "║  Bucket   : $BUCKET"
+echo "║  Targets  : $TARGETS"
+echo "╚══════════════════════════════════════════════════════╝"
+echo ""
 
 # ── Validate required vars ────────────────────────────────────────────────
 : "${LITESTREAM_S3_ENDPOINT:?Need LITESTREAM_S3_ENDPOINT}"
@@ -51,10 +123,6 @@ else
   TARGETS="$*"
 fi
 
-echo ""
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║           LITESTREAM S3 RESET TOOL                  ║"
-echo "╠══════════════════════════════════════════════════════╣"
 echo "║  Endpoint : $ENDPOINT"
 echo "║  Bucket   : $BUCKET"
 echo "║  Targets  : $TARGETS"
